@@ -12,7 +12,7 @@ const NUM_ACTIONS: usize = 4; // Actions: Up, Down, Left, Right
 const INITIAL_EPSILON: f64 = 0.9;
 const EPSILON_DECAY: f64 = 0.995;
 const MIN_EPSILON: f64 = 0.1;
-const EPISODES: usize = 10;
+const EPISODES: usize = 50;
 
 // Define the Experience Replay Buffer
 struct ReplayBuffer<B: Backend, const D: usize> {
@@ -130,6 +130,25 @@ impl<B: AutodiffBackend> QNetwork<B> {
         let loss = mse.forward_no_reduction(x, y);
     
         loss
+    }
+
+    fn dump(&self, device: &B::Device) {
+        for y in 0..GRID_SIZE {
+            let mut row = Array1::zeros([GRID_SIZE]);
+            for x in 0..GRID_SIZE {
+                let probe = Tensor::<B, 1>::from_floats([x as f64, y as f64], device);
+                let max = self.forward(probe).argmax(0);
+                row[x] = max.into_scalar().to_usize();
+            }
+    
+            println!("{}:[{}, {}, {}, {}, {}]", y, 
+                direction(row[0]), 
+                direction(row[1]),
+                direction(row[2]), 
+                direction(row[3]),
+                direction(row[4]), 
+            )
+        }
     }    
 }
 
@@ -147,8 +166,12 @@ fn main() {
     let mut optim = AdamConfig::new().init::<MyAutodiff, QNetwork<MyAutodiff>>();
 
     for _episode in 0..EPISODES {
-        let mut state = Tensor::from_floats::<&[f64]>(&[0.0, 0.0], &device);
+        let x = rng.random_range(0..GRID_SIZE) as f64;
+        let y = rng.random_range(0..GRID_SIZE) as f64;
+        let mut state = Tensor::from_floats::<&[f64]>(&[x, y], &device);
         let mut done = false;
+        let mut steps = 0;
+        let mut aggregated = 0.0;
 
         while !done {
             // Epsilon-greedy action selection
@@ -161,11 +184,15 @@ fn main() {
                 a as usize
             };
 
+            steps += 1;
+
             let (next_state, reward, terminal) = q_network.step(state.clone(), action, &device);
             done = terminal;
 
             buffer.push((state.clone(), action as i64, reward, next_state.clone(), done));
             state = next_state;
+
+            aggregated += reward;
 
             if buffer.buffer.len() > 64 {
                 let loss = q_network.compute_loss(&buffer, &device);
@@ -178,24 +205,10 @@ fn main() {
 
         // Decay epsilon
         epsilon = (epsilon * EPSILON_DECAY).max(MIN_EPSILON);
-    }
 
-    for y in 0..GRID_SIZE {
-        let mut row = Array1::zeros([GRID_SIZE]);
-        for x in 0..GRID_SIZE {
-            let probe = Tensor::<MyAutodiff, 1>::from_floats([x as f64, y as f64], &device);
-            let max = q_network.forward(probe).argmax(0);
-            row[x] = max.into_scalar() as usize;
-        }
-
-        println!("{}:[{}, {}, {}, {}, {}]", y, 
-            direction(row[0]), 
-            direction(row[1]),
-            direction(row[2]), 
-            direction(row[3]),
-            direction(row[4]), 
-        )
-    }
+        println!("EPISODE {} from ({};{}) in {} steps got {}", _episode, x, y, steps, aggregated);
+        q_network.dump(&device);
+    }    
 }
 
 fn direction(index: usize) -> String {
