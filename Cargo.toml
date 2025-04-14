@@ -6,5 +6,4 @@ edition = "2024"
 [dependencies]
 rand = "*"
 ndarray = "*"
-candle-core = "*"
-candle-nn = "*"
+burn = { version = "*", features = ["wgpu", "train"]}

@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 
+use burn::{backend::Autodiff, module::Module, nn::{loss::MseLoss, Linear, LinearConfig, Relu}, optim::{AdamConfig, GradientsParams, Optimizer}, prelude::Backend, tensor::{backend::AutodiffBackend, cast::ToElement, Float, Int, Tensor}};
 use ndarray::Array1;
 use rand::{rng, seq::IteratorRandom, Rng};
-use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{linear, loss::mse, AdamW, Optimizer, VarBuilder, VarMap};
+use burn::backend::Wgpu;
 
 const GRID_SIZE: usize = 5;
 const NUM_ACTIONS: usize = 4; // Actions: Up, Down, Left, Right
@@ -12,28 +12,28 @@ const NUM_ACTIONS: usize = 4; // Actions: Up, Down, Left, Right
 const INITIAL_EPSILON: f64 = 0.9;
 const EPSILON_DECAY: f64 = 0.995;
 const MIN_EPSILON: f64 = 0.1;
-const EPISODES: usize = 500;
+const EPISODES: usize = 10;
 
 // Define the Experience Replay Buffer
-struct ReplayBuffer {
-    buffer: VecDeque<(Tensor, i64, f64, Tensor, bool)>,
+struct ReplayBuffer<B: Backend, const D: usize> {
+    buffer: VecDeque<(Tensor<B, D>, i64, f64, Tensor<B, D>, bool)>,
 }
 
-impl ReplayBuffer {
+impl<B: Backend, const D: usize> ReplayBuffer<B, D> {
     fn new() -> Self {
         ReplayBuffer {
             buffer: VecDeque::with_capacity(10000),
         }
     }
 
-    fn push(&mut self, experience: (Tensor, i64, f64, Tensor, bool)) {
+    fn push(&mut self, experience: (Tensor<B, D>, i64, f64, Tensor<B, D>, bool)) {
         if self.buffer.len() == 10000 {
             self.buffer.pop_front(); // Remove oldest experience
         }
         self.buffer.push_back(experience);
     }
 
-    fn sample(&self) -> Vec<(Tensor, i64, f64, Tensor, bool)> {
+    fn sample(&self) -> Vec<(Tensor<B, D>, i64, f64, Tensor<B, D>, bool)> {
         let mut rng = rng();
         let indices: Vec<usize> = (0..self.buffer.len())
             .choose_multiple(&mut rng, 64);
@@ -43,72 +43,111 @@ impl ReplayBuffer {
     }
 }
 
-struct QNetwork {
-    layer1: linear::Linear,
-    layer2: linear::Linear,
-    output: linear::Linear,
-    optimizer: AdamW,
+struct QNetworkConfig {
+    layer1: LinearConfig,
+    layer2: LinearConfig,
+    output: LinearConfig,
 }
 
-impl QNetwork {
-    fn new(input_dim: usize, hidden_dim: usize, output_dim: usize, device: &Device) -> Result<Self> {
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F64, device);
-        let adam = AdamW::new_lr(varmap.all_vars(), 0.01).unwrap();
-
-        Ok(Self {
-            layer1: linear(input_dim, hidden_dim, vb.pp("l1"))?,
-            layer2: linear(hidden_dim, hidden_dim, vb.pp("l2"))?,
-            output: linear(hidden_dim, output_dim, vb.pp("ou"))?,
-            optimizer: adam,
-        })
+impl QNetworkConfig {
+    fn new(input_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
+        QNetworkConfig { 
+            layer1: LinearConfig { d_input: input_dim, d_output: hidden_dim, bias: true, initializer: burn::nn::Initializer::Zeros }, 
+            layer2: LinearConfig { d_input: hidden_dim, d_output: hidden_dim, bias: true, initializer: burn::nn::Initializer::Zeros }, 
+            output: LinearConfig { d_input: hidden_dim, d_output: output_dim, bias: true, initializer: burn::nn::Initializer::Zeros },
+        }
     }
 
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let x = input.apply(&self.layer1)?.relu().unwrap();
-        let x = x.apply(&self.layer2)?.relu().unwrap();
-        x.apply(&self.output)
+    fn build<B: AutodiffBackend>(&self, device: &B::Device) -> QNetwork<B> {
+        QNetwork { 
+            layer1: self.layer1.init(device), 
+            layer2: self.layer2.init(device), 
+            output: self.output.init(device),
+            relu: Relu::new(),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct QNetwork<B: Backend> {
+    layer1: Linear<B>,
+    relu: Relu,
+    layer2: Linear<B>,
+    output: Linear<B>,
+}
+
+impl<B: AutodiffBackend> QNetwork<B> {
+    fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
+        let x = self.layer1.forward(input);
+        let x = self.relu.forward(x);
+        let x = self.layer2.forward(x);
+        let x = self.relu.forward(x);
+        self.output.forward(x)
     }
 
-    fn train(&mut self, replay_buffer: &ReplayBuffer, device: &Device) -> Result<()> {
+    fn step(&self, state: Tensor<B, 1>, action: usize, device: &B::Device) -> (Tensor<B, 1>, f64, bool) {
+        let x = state.clone().select(0, Tensor::<B, 1, Int>::from_data([0], &device)).into_scalar().to_usize();
+        let y = state.select(0, Tensor::<B, 1, Int>::from_data([1], &device)).into_scalar().to_usize();
+    
+        let (next_x, next_y) = match action {
+            0 => (x, y.saturating_sub(1)), // Up
+            1 => (x, (y + 1).min(GRID_SIZE - 1)), // Down
+            2 => (x.saturating_sub(1), y), // Left
+            3 => ((x + 1).min(GRID_SIZE - 1), y), // Right
+            _ => (x, y),
+        };
+    
+        let next_state = Tensor::<B, 1>::from_floats([next_x as f64, next_y as f64], &device);
+        let reward = if next_y == GRID_SIZE - 1 && next_x == GRID_SIZE - 1 { 10.0 } else { -0.1 };
+        let terminal = reward == 10.0;
+    
+        (next_state, reward, terminal)
+    }
+
+    fn compute_loss(&mut self, replay_buffer: &ReplayBuffer<B, 1>, device: &B::Device) -> Tensor<B, 2> {
         let batches = replay_buffer.sample();
 
-        let states: Vec<_> = batches.iter().map(|e| e.0.clone()).collect();
-        let actions = batches.iter().map(|e| e.1);
-        let rewards = batches.iter().map(|e|e.2);
-        let results: Vec<_> = batches.iter().map(|e|e.3.clone()).collect();
-        let terminals = batches.iter().map(|e|e.4 as u8 as f64);
+        let states = batches.iter().map(|e| e.0.clone()).collect();
+        let acts: Vec<usize> = batches.iter().map(|e| e.1 as usize).collect();
+        let rewards: Vec<f64> = batches.iter().map(|e| e.2).collect();
+        let results = batches.iter().map(|e|e.3.clone()).collect();
+        let terminals: Vec<f64> = batches.iter().map(|e|e.4 as u8 as f64).collect();
 
-        let states = Tensor::stack(&states, 0)?;
-        let actions = Tensor::from_iter(actions, device)?.unsqueeze(1)?;
-        let rewards = Tensor::from_iter(rewards, device)?.unsqueeze(1)?;
-        let results = Tensor::stack(&results, 2)?;
-        let terminals = Tensor::from_iter(terminals, device)?.unsqueeze(1)?;
+        let states = Tensor::stack::<2>(states, 0);
+        let actions = Tensor::<B, 1, Int>::from_ints::<&[usize]>(acts.as_slice(), device).unsqueeze_dim(1);
+        let rewards = Tensor::<B, 1, Float>::from_floats::<&[f64]>(rewards.as_slice(), device).unsqueeze_dim(1);
+        let results = Tensor::stack::<2>(results, 0);
+        let terminals = Tensor::<B, 1, Float>::from_floats::<&[f64]>(terminals.as_slice(), device).unsqueeze_dim(1);
 
-        let estimation = self.forward(&states)?.gather(&actions, 1)?;
-        let expectation = self.forward(&results)?.detach();
+        let estimation = self.forward(states);
+        let x = estimation.gather(1, actions);
+        let expectation = self.forward(results).detach();
 
-        let y = expectation.max_keepdim(1)?;
-        let y = (y * 0.99 * terminals + rewards)?;
+        let y = expectation.max_dim(1);
+        let y = y * 0.99 * terminals + rewards;
 
-        let loss = mse(&estimation, &y)?;
-        self.optimizer.backward_step(&loss)?;
-
-        Ok(())
+        let mse = MseLoss::new();
+        let loss = mse.forward_no_reduction(x, y);
+    
+        loss
     }    
 }
 
 fn main() {
-    const DEVICE: Device = Device::Cpu;
+    type MyBackend = Wgpu<f32, i32>;
+    type MyAutodiff = Autodiff<MyBackend>;
 
-    let mut q_network = QNetwork::new(2, 64, 4, &DEVICE).unwrap();
+    let device = Default::default();
+
+    let mut q_network = QNetworkConfig::new(2, 64, 4).build::<MyAutodiff>(&device);
 
     let mut rng = rand::rng();
     let mut epsilon = INITIAL_EPSILON;
-    let mut buffer = ReplayBuffer::new();
+    let mut buffer = ReplayBuffer::<MyAutodiff, 1>::new();
+    let mut optim = AdamConfig::new().init::<MyAutodiff, QNetwork<MyAutodiff>>();
 
     for _episode in 0..EPISODES {
-        let mut state = Tensor::new(&[0.0, 0.0], &DEVICE).unwrap();
+        let mut state = Tensor::from_floats::<&[f64]>(&[0.0, 0.0], &device);
         let mut done = false;
 
         while !done {
@@ -116,23 +155,24 @@ fn main() {
             let action = if rng.random::<f64>() < epsilon {
                 rng.random_range(0..NUM_ACTIONS) // Explore
             } else {
-                let fr = q_network.forward(&state);
-
-                if fr.is_ok() {
-                    fr.unwrap().argmax(0).unwrap().to_scalar::<f64>().unwrap() as usize
-                } else {
-                    panic!("nneee")
-                }
+                let fr = q_network.forward(state.clone());
+                let a = fr.argmax(0).into_scalar();
+            
+                a as usize
             };
 
-            let (next_state, reward, terminal) = step(state.clone(), action, &DEVICE).unwrap();
+            let (next_state, reward, terminal) = q_network.step(state.clone(), action, &device);
             done = terminal;
 
             buffer.push((state.clone(), action as i64, reward, next_state.clone(), done));
             state = next_state;
 
             if buffer.buffer.len() > 64 {
-                _ = q_network.train(&buffer, &DEVICE);
+                let loss = q_network.compute_loss(&buffer, &device);
+                let grads = loss.backward();
+                let grads = GradientsParams::from_grads(grads, &q_network);
+
+                q_network = optim.step(0.01, q_network, grads);
             }
         }
 
@@ -143,11 +183,9 @@ fn main() {
     for y in 0..GRID_SIZE {
         let mut row = Array1::zeros([GRID_SIZE]);
         for x in 0..GRID_SIZE {
-            let probe = Tensor::new(&[x as f64, y as f64], &DEVICE).unwrap();
-
-            if let Ok(max) = q_network.forward(&probe).unwrap().argmax(0) {
-                row[x] = max.unsqueeze(1).unwrap().to_scalar::<f64>().unwrap() as usize;
-            }
+            let probe = Tensor::<MyAutodiff, 1>::from_floats([x as f64, y as f64], &device);
+            let max = q_network.forward(probe).argmax(0);
+            row[x] = max.into_scalar() as usize;
         }
 
         println!("{}:[{}, {}, {}, {}, {}]", y, 
@@ -170,21 +208,3 @@ fn direction(index: usize) -> String {
     }
 }
 
-fn step(state: Tensor, action: usize, device: &Device) -> Result<(Tensor, f64, bool)> {
-    let x: usize = state.get(0)?.to_scalar::<f64>()? as usize;
-    let y: usize = state.get(1)?.to_scalar::<f64>()? as usize;
-
-    let (next_x, next_y) = match action {
-        0 => (x, y.saturating_sub(1)), // Up
-        1 => (x, (y + 1).min(GRID_SIZE - 1)), // Down
-        2 => (x.saturating_sub(1), y), // Left
-        3 => ((x + 1).min(GRID_SIZE - 1), y), // Right
-        _ => (x, y),
-    };
-
-    let next_state = Tensor::new(&[next_x as f64, next_y as f64], device)?;
-    let reward = if next_y == GRID_SIZE - 1 && next_x == GRID_SIZE - 1 { 10.0 } else { -0.1 };
-    let terminal = reward == 10.0;
-
-    Ok((next_state, reward, terminal))
-}
