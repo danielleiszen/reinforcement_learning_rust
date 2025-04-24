@@ -12,7 +12,7 @@ const NUM_ACTIONS: usize = 4; // Actions: Up, Down, Left, Right
 const INITIAL_EPSILON: f64 = 0.9;
 const EPSILON_DECAY: f64 = 0.995;
 const MIN_EPSILON: f64 = 0.1;
-const EPISODES: usize = 50;
+const EPISODES: usize = 100;
 
 // Define the Experience Replay Buffer
 struct ReplayBuffer<B: Backend, const D: usize> {
@@ -52,9 +52,9 @@ struct QNetworkConfig {
 impl QNetworkConfig {
     fn new(input_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
         QNetworkConfig { 
-            layer1: LinearConfig { d_input: input_dim, d_output: hidden_dim, bias: true, initializer: burn::nn::Initializer::Zeros }, 
-            layer2: LinearConfig { d_input: hidden_dim, d_output: hidden_dim, bias: true, initializer: burn::nn::Initializer::Zeros }, 
-            output: LinearConfig { d_input: hidden_dim, d_output: output_dim, bias: true, initializer: burn::nn::Initializer::Zeros },
+            layer1: LinearConfig { d_input: input_dim, d_output: hidden_dim, bias: true, initializer: burn::nn::Initializer::Normal { mean: 0.5, std: 0.1 } }, 
+            layer2: LinearConfig { d_input: hidden_dim, d_output: hidden_dim, bias: true, initializer: burn::nn::Initializer::Normal { mean: 0.5, std: 0.1 } }, 
+            output: LinearConfig { d_input: hidden_dim, d_output: output_dim, bias: true, initializer: burn::nn::Initializer::Normal { mean: 0.5, std: 0.1 } },
         }
     }
 
@@ -63,7 +63,8 @@ impl QNetworkConfig {
             layer1: self.layer1.init(device), 
             layer2: self.layer2.init(device), 
             output: self.output.init(device),
-            relu: Relu::new(),
+            activation1: Relu::new(),
+            activation2: Relu::new(),
         }
     }
 }
@@ -71,17 +72,18 @@ impl QNetworkConfig {
 #[derive(Module, Debug)]
 struct QNetwork<B: Backend> {
     layer1: Linear<B>,
-    relu: Relu,
+    activation1: Relu,
     layer2: Linear<B>,
+    activation2: Relu,
     output: Linear<B>,
 }
 
 impl<B: AutodiffBackend> QNetwork<B> {
     fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
         let x = self.layer1.forward(input);
-        let x = self.relu.forward(x);
+        let x = self.activation1.forward(x);
         let x = self.layer2.forward(x);
-        let x = self.relu.forward(x);
+        let x = self.activation2.forward(x);
         self.output.forward(x)
     }
 
@@ -137,8 +139,13 @@ impl<B: AutodiffBackend> QNetwork<B> {
             let mut row = Array1::zeros([GRID_SIZE]);
             for x in 0..GRID_SIZE {
                 let probe = Tensor::<B, 1>::from_floats([x as f64, y as f64], device);
-                let max = self.forward(probe).argmax(0);
-                row[x] = max.into_scalar().to_usize();
+                let dta = probe.to_data();
+                let slc = dta.as_slice::<f32>().unwrap();
+                let probe = self.forward(probe);
+                let max = probe.argmax(0).into_scalar().to_usize();
+
+                println!("x: {}, y: {}, actions: {:?}, max: {}", x, y, slc, max);
+                row[x] = max;
             }
     
             println!("{}:[{}, {}, {}, {}, {}]", y, 
@@ -152,7 +159,7 @@ impl<B: AutodiffBackend> QNetwork<B> {
     }    
 }
 
-fn main() {
+fn main_old() {
     type MyBackend = Wgpu<f32, i32>;
     type MyAutodiff = Autodiff<MyBackend>;
 
@@ -221,3 +228,12 @@ fn direction(index: usize) -> String {
     }
 }
 
+fn main() {
+    type MyBackend = Wgpu<f32, i32>;
+    type MyAutodiff = Autodiff<MyBackend>;
+
+    let device = Default::default();
+
+    let t1 = Tensor::<MyAutodiff, 1>::from_floats([0.1], &device);
+    println!("T1: {}", t1.to_data());
+}
