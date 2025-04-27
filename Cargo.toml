@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rand = "*"
+rand = "0.9.1"
 ndarray = "*"
-burn = { version = "*", features = ["wgpu", "train"]}
+# nalgebra = "*"
+luminal = { version = "*" }
+# csv = "*"
